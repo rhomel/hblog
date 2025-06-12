@@ -4,43 +4,128 @@ import (
 	"bytes"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/russross/blackfriday/v2"
 )
 
+type article struct {
+	Date     time.Time
+	DateStr  string
+	Title    string
+	HTMLPath string
+}
+
 func main() {
-	// ensure output directory exists
-	outDir := "public"
-	if err := os.MkdirAll(outDir, 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "unable to create output dir: %v\n", err)
-		os.Exit(1)
+	// ensure output directories exist
+	if err := os.MkdirAll("public/articles", 0755); err != nil {
+		log.Fatalf("unable to create output dir: %v", err)
 	}
 
-	// read source markdown
-	srcPath := filepath.Join("blog", "index.md")
-	md, err := ioutil.ReadFile(srcPath)
+	// --- process blog/index.md ---
+	indexSrc := "blog/index.md"
+	mdIndex, err := ioutil.ReadFile(indexSrc)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "unable to read %s: %v\n", srcPath, err)
-		os.Exit(1)
+		log.Fatalf("unable to read %s: %v", indexSrc, err)
+	}
+	indexTitle := extractTitle(mdIndex)
+	indexHTML := blackfriday.Run(mdIndex)
+
+	// --- process blog/articles/*.md ---
+	articles, warnings := loadArticles("blog/articles")
+	for _, w := range warnings {
+		log.Println("warning:", w)
 	}
 
-	// extract first "# " header for title
-	title := "(no title)"
-	for _, line := range bytes.Split(md, []byte("\n")) {
-		if bytes.HasPrefix(line, []byte("# ")) {
-			title = strings.TrimSpace(string(bytes.TrimPrefix(line, []byte("# "))))
-			break
+	// sort newest first
+	sort.Slice(articles, func(i, j int) bool {
+		return articles[i].Date.After(articles[j].Date)
+	})
+
+	// build articles list section
+	var listBuf bytes.Buffer
+	if len(articles) > 0 {
+		listBuf.WriteString("<h2>Articles</h2>\n<ul>\n")
+		for _, a := range articles {
+			listBuf.WriteString(fmt.Sprintf(
+				`  <li>[%s] <a href="%s">%s</a></li>`+"\n",
+				a.DateStr, a.HTMLPath, a.Title,
+			))
 		}
+		listBuf.WriteString("</ul>\n")
 	}
 
-	// render full markdown to HTML
-	bodyHTML := blackfriday.Run(md)
+	// --- write public/index.html ---
+	indexOut := "public/index.html"
+	fullIndex := fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>%s</title>
+</head>
+<body>
+%s
+%s
+</body>
+</html>`, indexTitle, indexHTML, listBuf.String())
 
-	// wrap in skeleton
-	html := fmt.Sprintf(`<!DOCTYPE html>
+	if err := ioutil.WriteFile(indexOut, []byte(fullIndex), 0644); err != nil {
+		log.Fatalf("unable to write %s: %v", indexOut, err)
+	}
+
+	fmt.Printf("Generated %s with %d articles\n", indexOut, len(articles))
+}
+
+// loadArticles reads markdown files from dir, returns valid articles and warnings.
+func loadArticles(dir string) ([]article, []string) {
+	var arts []article
+	var warns []string
+	re := regexp.MustCompile(`^(\d{4}-\d{2}-\d{2})-(.+)\.md$`)
+
+	entries, err := ioutil.ReadDir(dir)
+	if err != nil {
+		warns = append(warns, fmt.Sprintf("cannot read directory %s: %v", dir, err))
+		return arts, warns
+	}
+
+	for _, fi := range entries {
+		if fi.IsDir() {
+			continue
+		}
+		name := fi.Name()
+		m := re.FindStringSubmatch(name)
+		if m == nil {
+			warns = append(warns, fmt.Sprintf("%s: filename does not match YYYY-MM-DD-name.md", name))
+			continue
+		}
+		dateStr := m[1]
+		date, err := time.Parse("2006-01-02", dateStr)
+		if err != nil {
+			warns = append(warns, fmt.Sprintf("%s: invalid date %s", name, dateStr))
+			continue
+		}
+
+		srcPath := filepath.Join(dir, name)
+		md, err := ioutil.ReadFile(srcPath)
+		if err != nil {
+			warns = append(warns, fmt.Sprintf("%s: unable to read: %v", name, err))
+			continue
+		}
+		title := extractTitle(md)
+
+		htmlName := strings.TrimSuffix(name, ".md") + ".html"
+		htmlPath := "articles/" + htmlName
+		outPath := filepath.Join("public", htmlPath)
+
+		// write individual article file
+		articleHTML := blackfriday.Run(md)
+		full := fmt.Sprintf(`<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
@@ -49,13 +134,30 @@ func main() {
 <body>
 %s
 </body>
-</html>`, title, bodyHTML)
+</html>`, title, articleHTML)
 
-	outPath := filepath.Join(outDir, "index.html")
-	if err := ioutil.WriteFile(outPath, []byte(html), 0644); err != nil {
-		fmt.Fprintf(os.Stderr, "unable to write %s: %v\n", outPath, err)
-		os.Exit(1)
+		if err := ioutil.WriteFile(outPath, []byte(full), 0644); err != nil {
+			warns = append(warns, fmt.Sprintf("%s: write error: %v", htmlName, err))
+			continue
+		}
+
+		arts = append(arts, article{
+			Date:     date,
+			DateStr:  dateStr,
+			Title:    title,
+			HTMLPath: htmlPath,
+		})
 	}
 
-	fmt.Printf("Generated %s\n", outPath)
+	return arts, warns
+}
+
+// extractTitle finds the first "# " header or returns "(no title)".
+func extractTitle(md []byte) string {
+	for _, line := range bytes.Split(md, []byte("\n")) {
+		if bytes.HasPrefix(line, []byte("# ")) {
+			return strings.TrimSpace(string(bytes.TrimPrefix(line, []byte("# "))))
+		}
+	}
+	return "(no title)"
 }
