@@ -28,21 +28,21 @@ something like:
 
 ```
 George: There's an awful lot of AI slop these days, just today I was reviewing
-several AI generated code commits.
+        several AI generated code commits.
 
-Alice: Ok, but did they work?
+Alice:  Ok, but did they work?
 
 George: Yes, but there were so many code quality issues! And does anyone even
-understand what the code is doing?
+        understand what the code is doing?
 
-Alice: Hmm, does it matter?
+Alice:  Hmm, does it matter?
 ```
 
 Here George laments that the craft of writing code is now lost to the means.
 And Alice argues bluntly that the craft was not necessarily important.
 
-If you asked me which side I was on not more than a few weeks ago, I would have
-said I'm with George.
+If you asked me which side I was on, not more than a few weeks ago, I would
+have said I'm with George.
 
 These days, especially after being force and actually using the LLMs for
 coding, I'm more in the middle: it is undeniable that the LLM will achieve

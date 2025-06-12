@@ -22,7 +22,25 @@ type article struct {
 	HTMLPath string
 }
 
+type theme struct {
+	FontFamily      string
+	FontColor       string
+	BackgroundColor string
+	MaxContentWidth string
+}
+
 func main() {
+	// load theme
+	themeFile := "blog/themes/default.md"
+	th, err := loadTheme(themeFile)
+	if err != nil {
+		log.Fatalf("unable to load theme %s: %v", themeFile, err)
+	}
+
+	// build CSS style from theme
+	style := fmt.Sprintf(`body { font-family: %s; color: %s; background-color: %s; }`+"\n"+`.container { max-width: %s; margin: auto; }`,
+		th.FontFamily, th.FontColor, th.BackgroundColor, th.MaxContentWidth)
+
 	// ensure output directories exist
 	if err := os.MkdirAll("public/articles", 0755); err != nil {
 		log.Fatalf("unable to create output dir: %v", err)
@@ -38,7 +56,7 @@ func main() {
 	indexHTML := blackfriday.Run(mdIndex)
 
 	// --- process blog/articles/*.md ---
-	articles, warnings := loadArticles("blog/articles")
+	articles, warnings := loadArticles("blog/articles", style)
 	for _, w := range warnings {
 		log.Println("warning:", w)
 	}
@@ -54,7 +72,7 @@ func main() {
 		listBuf.WriteString("<h2>Articles</h2>\n<ul>\n")
 		for _, a := range articles {
 			listBuf.WriteString(fmt.Sprintf(
-				`  <li>[%s] <a href="%s">%s</a></li>`+"\n",
+				"  <li>[%s] <a href=\"%s\">%s</a></li>\n",
 				a.DateStr, a.HTMLPath, a.Title,
 			))
 		}
@@ -66,14 +84,17 @@ func main() {
 	fullIndex := fmt.Sprintf(`<!DOCTYPE html>
 <html>
 <head>
-  <meta charset="utf-8">
+  <meta charset=\"utf-8\">
   <title>%s</title>
+  <style>
+%s
+  </style>
 </head>
 <body>
-%s
-%s
+  <div class="container">%s%s  </div>
 </body>
-</html>`, indexTitle, indexHTML, listBuf.String())
+</html>`,
+		indexTitle, style, indexHTML, listBuf.String())
 
 	if err := ioutil.WriteFile(indexOut, []byte(fullIndex), 0644); err != nil {
 		log.Fatalf("unable to write %s: %v", indexOut, err)
@@ -83,7 +104,7 @@ func main() {
 }
 
 // loadArticles reads markdown files from dir, returns valid articles and warnings.
-func loadArticles(dir string) ([]article, []string) {
+func loadArticles(dir, style string) ([]article, []string) {
 	var arts []article
 	var warns []string
 	re := regexp.MustCompile(`^(\d{4}-\d{2}-\d{2})-(.+)\.md$`)
@@ -128,13 +149,17 @@ func loadArticles(dir string) ([]article, []string) {
 		full := fmt.Sprintf(`<!DOCTYPE html>
 <html>
 <head>
-  <meta charset="utf-8">
+  <meta charset=\"utf-8\">
   <title>%s</title>
+  <style>
+%s
+  </style>
 </head>
 <body>
-%s
+  <div class="container">%s
+  </div>
 </body>
-</html>`, title, articleHTML)
+</html>`, title, style, articleHTML)
 
 		if err := ioutil.WriteFile(outPath, []byte(full), 0644); err != nil {
 			warns = append(warns, fmt.Sprintf("%s: write error: %v", htmlName, err))
@@ -150,6 +175,46 @@ func loadArticles(dir string) ([]article, []string) {
 	}
 
 	return arts, warns
+}
+
+// loadTheme parses a theme markdown, extracting properties under "# Properties".
+func loadTheme(path string) (theme, error) {
+	var th theme
+	content, err := ioutil.ReadFile(path)
+	if err != nil {
+		return th, err
+	}
+	lines := bytes.Split(content, []byte("\n"))
+	inProps := false
+	re := regexp.MustCompile(`^-\s*([a-z-]+):\s*(.+)$`)
+	for _, line := range lines {
+		trim := strings.TrimSpace(string(line))
+		if strings.EqualFold(trim, "# Properties") {
+			inProps = true
+			continue
+		}
+		if inProps {
+			if strings.HasPrefix(trim, "# ") {
+				break
+			}
+			m := re.FindStringSubmatch(trim)
+			if m != nil {
+				key := m[1]
+				val := m[2]
+				switch key {
+				case "font-family":
+					th.FontFamily = val
+				case "font-color":
+					th.FontColor = val
+				case "background-color":
+					th.BackgroundColor = val
+				case "max-content-width":
+					th.MaxContentWidth = val
+				}
+			}
+		}
+	}
+	return th, nil
 }
 
 // extractTitle finds the first "# " header or returns "(no title)".
