@@ -2,24 +2,28 @@ package main
 
 import (
 	"bytes"
+	"flag"
 	"fmt"
-	"io/ioutil"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/russross/blackfriday/v2"
 )
 
 type article struct {
-	Date     time.Time
-	DateStr  string
-	Title    string
-	HTMLPath string
+	MDName   string    // markdown filename
+	Date     time.Time // parsed date
+	DateStr  string    // date string
+	Title    string    // extracted title
+	HTMLPath string    // output html relative path
 }
 
 type theme struct {
@@ -30,163 +34,259 @@ type theme struct {
 }
 
 func main() {
-	// load theme
-	themeFile := "blog/themes/default.md"
-	th, err := loadTheme(themeFile)
-	if err != nil {
-		log.Fatalf("unable to load theme %s: %v", themeFile, err)
+	watchDir := flag.String("watch", "", "directory to watch for changes")
+	flag.Parse()
+
+	if *watchDir == "" {
+		executeOnce()
+		return
 	}
 
-	// build CSS style from theme
-	style := fmt.Sprintf(`body { font-family: %s; color: %s; background-color: %s; }`+"\n"+`.container { max-width: %s; margin: auto; }`,
-		th.FontFamily, th.FontColor, th.BackgroundColor, th.MaxContentWidth)
+	// watch mode
+	fmt.Printf("watching %s...\n", *watchDir)
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Fatalf("unable to initialize watcher: %v", err)
+	}
+	defer watcher.Close()
+
+	// watch recursively
+	err = filepath.WalkDir(*watchDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			return watcher.Add(path)
+		}
+		return nil
+	})
+	if err != nil {
+		log.Fatalf("unable to watch directory %s: %v", *watchDir, err)
+	}
+
+	// initial generate
+	fmt.Println("generating...")
+	executeOnceWithLogs()
+
+	// debounce setup
+	var mu sync.Mutex
+	var timer *time.Timer
+	reset := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if timer != nil {
+			timer.Stop()
+		}
+		timer = time.AfterFunc(500*time.Millisecond, func() {
+			fmt.Println("generating...")
+			executeOnceWithLogs()
+		})
+	}
+
+	// event loop
+	for {
+		select {
+		case ev, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
+			if ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0 {
+				reset()
+			}
+
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return
+			}
+			log.Printf("watcher error: %v", err)
+		}
+	}
+}
+
+func executeOnce() {
+	count, err := runGeneration()
+	if err != nil {
+		log.Fatalf("generation error: %v", err)
+	}
+	fmt.Printf("generated %d files\n", count)
+}
+
+func executeOnceWithLogs() {
+	count, err := runGeneration()
+	if err != nil {
+		log.Printf("generation error: %v", err)
+	} else {
+		fmt.Printf("generated %d files\n", count)
+	}
+}
+
+// runGeneration performs a single site generation. Returns total HTML files produced.
+func runGeneration() (int, error) {
+	// load theme
+	th, err := loadTheme("blog/themes/default.md")
+	if err != nil {
+		return 0, fmt.Errorf("unable to load theme: %w", err)
+	}
+	style := fmt.Sprintf(
+		`body { font-family: %s; color: %s; background-color: %s; }`+"\n"+
+			`.container { max-width: %s; margin: auto; }`,
+		th.FontFamily, th.FontColor, th.BackgroundColor, th.MaxContentWidth,
+	)
 
 	// ensure output directories exist
 	if err := os.MkdirAll("public/articles", 0755); err != nil {
-		log.Fatalf("unable to create output dir: %v", err)
+		return 0, err
 	}
 
-	// --- process blog/index.md ---
-	indexSrc := "blog/index.md"
-	mdIndex, err := ioutil.ReadFile(indexSrc)
+	// process index.md
+	mdIndex, err := os.ReadFile("blog/index.md")
 	if err != nil {
-		log.Fatalf("unable to read %s: %v", indexSrc, err)
+		return 0, err
 	}
 	indexTitle := extractTitle(mdIndex)
 	indexHTML := blackfriday.Run(mdIndex)
 
-	// --- process blog/articles/*.md ---
-	articles, warnings := loadArticles("blog/articles", style)
+	// process articles list
+	articles, warnings := loadArticles("blog/articles")
 	for _, w := range warnings {
 		log.Println("warning:", w)
 	}
 
-	// sort newest first
-	sort.Slice(articles, func(i, j int) bool {
-		return articles[i].Date.After(articles[j].Date)
-	})
+	// write article pages
+	articleCount := writeArticles(articles, style)
 
-	// build articles list section
-	var listBuf bytes.Buffer
-	if len(articles) > 0 {
-		listBuf.WriteString("<h2>Articles</h2>\n<ul>\n")
-		for _, a := range articles {
-			listBuf.WriteString(fmt.Sprintf(
-				"  <li>[%s] <a href=\"%s\">%s</a></li>\n",
-				a.DateStr, a.HTMLPath, a.Title,
-			))
-		}
-		listBuf.WriteString("</ul>\n")
-	}
-
-	// --- write public/index.html ---
-	indexOut := "public/index.html"
-	fullIndex := fmt.Sprintf(`<!DOCTYPE html>
+	// write index.html (including articles list)
+	listHTML := buildListHTML(articles)
+	full := fmt.Sprintf(`<!DOCTYPE html>
 <html>
 <head>
-  <meta charset=\"utf-8\">
+  <meta charset="utf-8">
   <title>%s</title>
   <style>
 %s
   </style>
 </head>
 <body>
-  <div class="container">%s%s  </div>
+  <div class="container">
+%s
+%s
+  </div>
 </body>
 </html>`,
-		indexTitle, style, indexHTML, listBuf.String())
-
-	if err := ioutil.WriteFile(indexOut, []byte(fullIndex), 0644); err != nil {
-		log.Fatalf("unable to write %s: %v", indexOut, err)
+		indexTitle, style, indexHTML, listHTML,
+	)
+	if err := os.WriteFile("public/index.html", []byte(full), 0644); err != nil {
+		return articleCount, err
 	}
 
-	fmt.Printf("Generated %s with %d articles\n", indexOut, len(articles))
+	// +1 for index
+	return articleCount + 1, nil
 }
 
-// loadArticles reads markdown files from dir, returns valid articles and warnings.
-func loadArticles(dir, style string) ([]article, []string) {
+func writeArticles(articles []article, style string) int {
+	count := 0
+	for _, a := range articles {
+		mdPath := filepath.Join("blog/articles", a.MDName)
+		md, err := os.ReadFile(mdPath)
+		if err != nil {
+			continue
+		}
+		htmlContent := blackfriday.Run(md)
+		page := fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>%s</title>
+  <style>
+%s
+  </style>
+</head>
+<body>
+  <div class="container">
+%s
+  </div>
+</body>
+</html>`,
+			a.Title, style, htmlContent,
+		)
+		out := filepath.Join("public", a.HTMLPath)
+		if err := os.WriteFile(out, []byte(page), 0644); err == nil {
+			count++
+		}
+	}
+	return count
+}
+
+func buildListHTML(articles []article) string {
+	var buf bytes.Buffer
+	if len(articles) > 0 {
+		buf.WriteString("<h2>Articles</h2>\n<ul>\n")
+		for _, a := range articles {
+			buf.WriteString(fmt.Sprintf(
+				"  <li>[%s] <a href=\"%s\">%s</a></li>\n",
+				a.DateStr, a.HTMLPath, a.Title,
+			))
+		}
+		buf.WriteString("</ul>\n")
+	}
+	return buf.String()
+}
+
+func loadArticles(dir string) ([]article, []string) {
 	var arts []article
 	var warns []string
 	re := regexp.MustCompile(`^(\d{4}-\d{2}-\d{2})-(.+)\.md$`)
-
-	entries, err := ioutil.ReadDir(dir)
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		warns = append(warns, fmt.Sprintf("cannot read directory %s: %v", dir, err))
 		return arts, warns
 	}
-
-	for _, fi := range entries {
-		if fi.IsDir() {
+	for _, e := range entries {
+		if e.IsDir() {
 			continue
 		}
-		name := fi.Name()
+		name := e.Name()
 		m := re.FindStringSubmatch(name)
 		if m == nil {
 			warns = append(warns, fmt.Sprintf("%s: filename does not match YYYY-MM-DD-name.md", name))
 			continue
 		}
-		dateStr := m[1]
-		date, err := time.Parse("2006-01-02", dateStr)
+		date, err := time.Parse("2006-01-02", m[1])
 		if err != nil {
-			warns = append(warns, fmt.Sprintf("%s: invalid date %s", name, dateStr))
+			warns = append(warns, fmt.Sprintf("%s: invalid date %s", name, m[1]))
 			continue
 		}
-
-		srcPath := filepath.Join(dir, name)
-		md, err := ioutil.ReadFile(srcPath)
-		if err != nil {
-			warns = append(warns, fmt.Sprintf("%s: unable to read: %v", name, err))
-			continue
-		}
-		title := extractTitle(md)
-
+		title := extractTitleFromFile(filepath.Join(dir, name))
 		htmlName := strings.TrimSuffix(name, ".md") + ".html"
-		htmlPath := "articles/" + htmlName
-		outPath := filepath.Join("public", htmlPath)
-
-		// write individual article file
-		articleHTML := blackfriday.Run(md)
-		full := fmt.Sprintf(`<!DOCTYPE html>
-<html>
-<head>
-  <meta charset=\"utf-8\">
-  <title>%s</title>
-  <style>
-%s
-  </style>
-</head>
-<body>
-  <div class="container">%s
-  </div>
-</body>
-</html>`, title, style, articleHTML)
-
-		if err := ioutil.WriteFile(outPath, []byte(full), 0644); err != nil {
-			warns = append(warns, fmt.Sprintf("%s: write error: %v", htmlName, err))
-			continue
-		}
-
 		arts = append(arts, article{
+			MDName:   name,
 			Date:     date,
-			DateStr:  dateStr,
+			DateStr:  m[1],
 			Title:    title,
-			HTMLPath: htmlPath,
+			HTMLPath: "articles/" + htmlName,
 		})
 	}
-
+	sort.Slice(arts, func(i, j int) bool { return arts[i].Date.After(arts[j].Date) })
 	return arts, warns
 }
 
-// loadTheme parses a theme markdown, extracting properties under "# Properties".
+func extractTitleFromFile(path string) string {
+	md, err := os.ReadFile(path)
+	if err != nil {
+		return "(no title)"
+	}
+	return extractTitle(md)
+}
+
 func loadTheme(path string) (theme, error) {
 	var th theme
-	content, err := ioutil.ReadFile(path)
+	content, err := os.ReadFile(path)
 	if err != nil {
 		return th, err
 	}
 	lines := bytes.Split(content, []byte("\n"))
 	inProps := false
-	re := regexp.MustCompile(`^-\s*([a-z-]+):\s*(.+)$`)
+	re := regexp.MustCompile(`^\-\s*([a-z\-]+):\s*(.+)$`)
 	for _, line := range lines {
 		trim := strings.TrimSpace(string(line))
 		if strings.EqualFold(trim, "# Properties") {
@@ -197,19 +297,16 @@ func loadTheme(path string) (theme, error) {
 			if strings.HasPrefix(trim, "# ") {
 				break
 			}
-			m := re.FindStringSubmatch(trim)
-			if m != nil {
-				key := m[1]
-				val := m[2]
-				switch key {
+			if m := re.FindStringSubmatch(trim); m != nil {
+				switch m[1] {
 				case "font-family":
-					th.FontFamily = val
+					th.FontFamily = m[2]
 				case "font-color":
-					th.FontColor = val
+					th.FontColor = m[2]
 				case "background-color":
-					th.BackgroundColor = val
+					th.BackgroundColor = m[2]
 				case "max-content-width":
-					th.MaxContentWidth = val
+					th.MaxContentWidth = m[2]
 				}
 			}
 		}
@@ -217,7 +314,6 @@ func loadTheme(path string) (theme, error) {
 	return th, nil
 }
 
-// extractTitle finds the first "# " header or returns "(no title)".
 func extractTitle(md []byte) string {
 	for _, line := range bytes.Split(md, []byte("\n")) {
 		if bytes.HasPrefix(line, []byte("# ")) {
