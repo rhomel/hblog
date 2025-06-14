@@ -27,13 +27,6 @@ type article struct {
 	HTMLPath string
 }
 
-type theme struct {
-	FontFamily      string
-	FontColor       string
-	BackgroundColor string
-	MaxContentWidth string
-}
-
 // broadcaster for SSE reload events
 var clientsMu sync.Mutex
 var clients = make(map[chan string]struct{})
@@ -212,9 +205,12 @@ func runGeneration() (int, error) {
 		return 0, fmt.Errorf("unable to load theme: %w", err)
 	}
 	style := fmt.Sprintf(
-		`body { font-family: %s; color: %s; background-color: %s; }`+"\n"+
-			`.container { max-width: %s; margin: auto; }`,
-		th.FontFamily, th.FontColor, th.BackgroundColor, th.MaxContentWidth,
+		`
+	body { font-family: %s; color: %s; background-color: %s; }
+	.container { max-width: %s; margin: auto; }
+	.container p { line-height: %s }
+		`,
+		th.FontFamily, th.FontColor, th.BackgroundColor, th.MaxContentWidth, th.ArticleLineHeight,
 	)
 
 	// ensure output directories exist
@@ -240,7 +236,7 @@ func runGeneration() (int, error) {
 	articleCount := writeArticles(articles, style)
 
 	// write index.html (including articles list)
-	listHTML := buildListHTML(articles)
+	listHTML := buildListHTML(articles, th.TextDeEmphasize)
 	full := fmt.Sprintf(`<!DOCTYPE html>
 <html>
 <head>
@@ -301,14 +297,15 @@ func writeArticles(articles []article, style string) int {
 	return count
 }
 
-func buildListHTML(articles []article) string {
+func buildListHTML(articles []article, dateColor string) string {
 	var buf bytes.Buffer
 	if len(articles) > 0 {
 		buf.WriteString("<h2>Articles</h2>\n<ul>\n")
 		for _, a := range articles {
+			// date without brackets, colored de‑emphasized
 			buf.WriteString(fmt.Sprintf(
-				"  <li>[%s] <a href=\"%s\">%s</a></li>\n",
-				a.DateStr, a.HTMLPath, a.Title,
+				"  <li><span style=\"color: %s\">%s</span> <a href=\"%s\">%s</a></li>\n",
+				dateColor, a.DateStr, a.HTMLPath, a.Title,
 			))
 		}
 		buf.WriteString("</ul>\n")
@@ -360,42 +357,6 @@ func extractTitleFromFile(path string) string {
 		return "(no title)"
 	}
 	return extractTitle(md)
-}
-
-func loadTheme(path string) (theme, error) {
-	var th theme
-	content, err := os.ReadFile(path)
-	if err != nil {
-		return th, err
-	}
-	lines := bytes.Split(content, []byte("\n"))
-	inProps := false
-	re := regexp.MustCompile(`^\-\s*([a-z\-]+):\s*(.+)$`)
-	for _, line := range lines {
-		trim := strings.TrimSpace(string(line))
-		if strings.EqualFold(trim, "# Properties") {
-			inProps = true
-			continue
-		}
-		if inProps {
-			if strings.HasPrefix(trim, "# ") {
-				break
-			}
-			if m := re.FindStringSubmatch(trim); m != nil {
-				switch m[1] {
-				case "font-family":
-					th.FontFamily = m[2]
-				case "font-color":
-					th.FontColor = m[2]
-				case "background-color":
-					th.BackgroundColor = m[2]
-				case "max-content-width":
-					th.MaxContentWidth = m[2]
-				}
-			}
-		}
-	}
-	return th, nil
 }
 
 func extractTitle(md []byte) string {

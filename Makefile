@@ -7,7 +7,7 @@ BIN := bin/hblog
 all: run
 
 build:
-	go build -o $(BIN) cmd/main.go
+	go build -o $(BIN) cmd/main.go cmd/theme.go
 
 run: build
 	$(BIN)
