@@ -1,12 +1,19 @@
-.PHONY: all build run watch
+# Define common variables
+BLOG_DIR := ./blog
+BIN := bin/hblog
+
+.PHONY: all build run watch serve
 
 all: run
 
 build:
-	go build -o bin/hblog cmd/main.go
+	go build -o $(BIN) cmd/main.go
 
 run: build
-	./bin/hblog
+	$(BIN)
 
 watch: build
-	./bin/hblog -watch=./blog
+	$(BIN) -watch=$(BLOG_DIR)
+
+serve: build
+	$(BIN) -serve -watch=$(BLOG_DIR)

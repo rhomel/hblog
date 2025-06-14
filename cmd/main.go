@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -19,11 +20,11 @@ import (
 )
 
 type article struct {
-	MDName   string    // markdown filename
-	Date     time.Time // parsed date
-	DateStr  string    // date string
-	Title    string    // extracted title
-	HTMLPath string    // output html relative path
+	MDName   string
+	Date     time.Time
+	DateStr  string
+	Title    string
+	HTMLPath string
 }
 
 type theme struct {
@@ -33,42 +34,132 @@ type theme struct {
 	MaxContentWidth string
 }
 
+// broadcaster for SSE reload events
+var clientsMu sync.Mutex
+var clients = make(map[chan string]struct{})
+
 func main() {
+	// allow "-serve" with no value to default to localhost:8888
+	for i, arg := range os.Args {
+		if arg == "-serve" {
+			os.Args[i] = "-serve=localhost:8888"
+		}
+	}
+
 	watchDir := flag.String("watch", "", "directory to watch for changes")
+	serveAddr := flag.String("serve", "localhost:8888", "address to serve HTTP ("+"localhost:8888)")
 	flag.Parse()
 
-	if *watchDir == "" {
-		executeOnce()
+	// if serve only
+	if *serveAddr != "" && *watchDir == "" {
+		startServer(*serveAddr)
 		return
 	}
 
-	// watch mode
-	fmt.Printf("watching %s...\n", *watchDir)
+	// watch mode with optional serve
+	if *watchDir != "" {
+		// start HTTP if needed
+		if *serveAddr != "" {
+			go startServer(*serveAddr)
+		}
+
+		fmt.Printf("watching %s...\n", *watchDir)
+		watchAndGenerate(*watchDir)
+		return
+	}
+
+	// no flags: single generation
+	executeOnce()
+}
+
+func startServer(addr string) {
+	mux := http.NewServeMux()
+	// static files
+	fileHandler := http.FileServer(http.Dir("public"))
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, ".html") || r.URL.Path == "/" {
+			// load file
+			path := filepath.Join("public", r.URL.Path)
+			if r.URL.Path == "/" {
+				path = filepath.Join("public", "index.html")
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				http.NotFound(w, r)
+				return
+			}
+			// inject reload script before </head>
+			script := `<script>
+			var es = new EventSource('/_sse');
+			es.onmessage = function(e) { if (e.data === 'reload') window.location.reload(); };
+			</script>`
+			out := bytes.Replace(data, []byte("</head>"), []byte(script+"</head>"), 1)
+			w.Write(out)
+			return
+		}
+		// other assets
+		fileHandler.ServeHTTP(w, r)
+	})
+	// SSE endpoint
+	mux.HandleFunc("/_sse", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		ch := make(chan string)
+		clientsMu.Lock()
+		clients[ch] = struct{}{}
+		clientsMu.Unlock()
+
+		notify := w.(http.CloseNotifier).CloseNotify()
+		go func() {
+			<-notify
+			clientsMu.Lock()
+			delete(clients, ch)
+			clientsMu.Unlock()
+		}()
+
+		for msg := range ch {
+			fmt.Fprintf(w, "data: %s\n\n", msg)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+	})
+
+	log.Printf("serving on %s...", addr)
+	if err := http.ListenAndServe(addr, mux); err != nil {
+		log.Fatalf("server error: %v", err)
+	}
+}
+
+func broadcast(msg string) {
+	clientsMu.Lock()
+	defer clientsMu.Unlock()
+	for ch := range clients {
+		select {
+		case ch <- msg:
+		default:
+		}
+	}
+}
+
+func watchAndGenerate(dir string) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		log.Fatalf("unable to initialize watcher: %v", err)
+		log.Fatalf("unable to init watcher: %v", err)
 	}
 	defer watcher.Close()
-
-	// watch recursively
-	err = filepath.WalkDir(*watchDir, func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if d.IsDir() {
-			return watcher.Add(path)
+	filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err == nil && d.IsDir() {
+			watcher.Add(path)
 		}
 		return nil
 	})
-	if err != nil {
-		log.Fatalf("unable to watch directory %s: %v", *watchDir, err)
-	}
 
-	// initial generate
-	fmt.Println("generating...")
-	executeOnceWithLogs()
+	// initial gen
+	log.Println("generating...")
+	executeOnceWithBroadcast()
 
-	// debounce setup
+	// debounce
 	var mu sync.Mutex
 	var timer *time.Timer
 	reset := func() {
@@ -78,27 +169,19 @@ func main() {
 			timer.Stop()
 		}
 		timer = time.AfterFunc(500*time.Millisecond, func() {
-			fmt.Println("generating...")
-			executeOnceWithLogs()
+			log.Println("generating...")
+			executeOnceWithBroadcast()
 		})
 	}
 
-	// event loop
 	for {
 		select {
-		case ev, ok := <-watcher.Events:
-			if !ok {
-				return
-			}
+		case ev := <-watcher.Events:
 			if ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0 {
 				reset()
 			}
-
-		case err, ok := <-watcher.Errors:
-			if !ok {
-				return
-			}
-			log.Printf("watcher error: %v", err)
+		case err := <-watcher.Errors:
+			log.Printf("watch error: %v", err)
 		}
 	}
 }
@@ -111,12 +194,13 @@ func executeOnce() {
 	fmt.Printf("generated %d files\n", count)
 }
 
-func executeOnceWithLogs() {
+func executeOnceWithBroadcast() {
 	count, err := runGeneration()
 	if err != nil {
 		log.Printf("generation error: %v", err)
 	} else {
 		fmt.Printf("generated %d files\n", count)
+		broadcast("reload")
 	}
 }
 
